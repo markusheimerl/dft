@@ -1,6 +1,6 @@
 CC = clang
 CFLAGS = -O3 -march=native -ffast-math -Wall -Wextra
-LDFLAGS = -static -lopenblas -lm -flto
+LDFLAGS = -lopenblas -llapacke -lm -flto
 
 dft.out: dft.c
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
