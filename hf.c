@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
+#include <cblas.h>
+#include <lapacke.h>
 
 #define DIM 2
 #define NELEC 2
@@ -47,12 +50,15 @@ double tei(int a, int b, int c, int d) {
 }
 
 void makefock(double Hcore[DIM][DIM], double P[DIM][DIM], double F[DIM][DIM]) {
+    // Copy Hcore to F
+    cblas_dcopy(DIM * DIM, (double*)Hcore, 1, (double*)F, 1);
+    
+    // Add two-electron contributions
     for (int i = 0; i < DIM; i++) {
         for (int j = 0; j < DIM; j++) {
-            F[i][j] = Hcore[i][j];
             for (int k = 0; k < DIM; k++) {
                 for (int l = 0; l < DIM; l++) {
-                    F[i][j] = F[i][j] + P[k][l] * (tei(i+1,j+1,k+1,l+1) - 0.5*tei(i+1,k+1,j+1,l+1));
+                    F[i][j] += P[k][l] * (tei(i+1,j+1,k+1,l+1) - 0.5*tei(i+1,k+1,j+1,l+1));
                 }
             }
         }
@@ -70,70 +76,60 @@ double currentenergy(double D[DIM][DIM], double Hcore[DIM][DIM], double F[DIM][D
 }
 
 double deltap(double D[DIM][DIM], double Dold[DIM][DIM]) {
-    double DELTA = 0.0;
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            DELTA = DELTA + ((D[i][j] - Dold[i][j]) * (D[i][j] - Dold[i][j]));
-        }
-    }
-    return sqrt(DELTA);
+    double diff[DIM][DIM];
+    
+    // Calculate difference matrix: diff = D - Dold
+    cblas_dcopy(DIM * DIM, (double*)D, 1, (double*)diff, 1);
+    cblas_daxpy(DIM * DIM, -1.0, (double*)Dold, 1, (double*)diff, 1);
+    
+    // Calculate Frobenius norm: sqrt(sum of squares)
+    double norm = cblas_dnrm2(DIM * DIM, (double*)diff, 1);
+    
+    return norm;
 }
 
-// Analytical eigenvalue/eigenvector solution for 2x2 symmetric matrix
-void diagonalize_2x2(double mat[DIM][DIM], double eigenvalues[DIM], double eigenvectors[DIM][DIM]) {
-    double a = mat[0][0];
-    double b = mat[0][1];  // = mat[1][0] for symmetric matrix
-    double c = mat[1][1];
+// Diagonalize symmetric matrix using LAPACK, but match original analytical results
+void diagonalize_symmetric(double mat[DIM][DIM], double eigenvalues[DIM], double eigenvectors[DIM][DIM]) {
+    // Work arrays for LAPACK
+    double work_matrix[DIM * DIM];
+    double work_eigenvalues[DIM];
     
-    // Calculate eigenvalues using quadratic formula
-    double trace = a + c;
-    double det = a * c - b * b;
-    double discriminant = trace * trace - 4 * det;
+    // Copy matrix to work array (column-major for LAPACK)
+    for (int i = 0; i < DIM; i++) {
+        for (int j = 0; j < DIM; j++) {
+            work_matrix[j * DIM + i] = mat[i][j];  // Transpose for column-major
+        }
+    }
     
-    if (discriminant < 0) {
-        printf("Error: negative discriminant in eigenvalue calculation\n");
+    // Call LAPACK symmetric eigenvalue solver
+    int info = LAPACKE_dsyev(LAPACK_COL_MAJOR, 'V', 'U', DIM, work_matrix, DIM, work_eigenvalues);
+    
+    if (info != 0) {
+        printf("Error: LAPACK dsyev failed with info = %d\n", info);
         exit(1);
     }
     
-    eigenvalues[0] = (trace - sqrt(discriminant)) / 2.0;  // smaller eigenvalue
-    eigenvalues[1] = (trace + sqrt(discriminant)) / 2.0;  // larger eigenvalue
-    
-    // Calculate eigenvectors
-    // For eigenvalue λ₀ (smaller)
-    if (fabs(b) > EPSILON) {
-        double norm0 = sqrt((eigenvalues[0] - c) * (eigenvalues[0] - c) + b * b);
-        eigenvectors[0][0] = (eigenvalues[0] - c) / norm0;
-        eigenvectors[1][0] = b / norm0;
-    } else if (fabs(eigenvalues[0] - a) < EPSILON) {
-        eigenvectors[0][0] = 1.0;
-        eigenvectors[1][0] = 0.0;
-    } else {
-        eigenvectors[0][0] = 0.0;
-        eigenvectors[1][0] = 1.0;
+    // Copy eigenvalues
+    for (int i = 0; i < DIM; i++) {
+        eigenvalues[i] = work_eigenvalues[i];
     }
     
-    // For eigenvalue λ₁ (larger)
-    if (fabs(b) > EPSILON) {
-        double norm1 = sqrt((eigenvalues[1] - c) * (eigenvalues[1] - c) + b * b);
-        eigenvectors[0][1] = (eigenvalues[1] - c) / norm1;
-        eigenvectors[1][1] = b / norm1;
-    } else if (fabs(eigenvalues[1] - a) < EPSILON) {
-        eigenvectors[0][1] = 1.0;
-        eigenvectors[1][1] = 0.0;
-    } else {
-        eigenvectors[0][1] = 0.0;
-        eigenvectors[1][1] = 1.0;
+    // Copy eigenvectors back to row-major format
+    // LAPACK returns eigenvectors as columns in column-major format
+    for (int i = 0; i < DIM; i++) {
+        for (int j = 0; j < DIM; j++) {
+            eigenvectors[i][j] = work_matrix[j * DIM + i];
+        }
     }
     
-    // Ensure orthogonality and correct signs to match NumPy convention
-    // NumPy tends to prefer positive first components
-    if (eigenvectors[0][0] < 0) {
-        eigenvectors[0][0] = -eigenvectors[0][0];
-        eigenvectors[1][0] = -eigenvectors[1][0];
-    }
-    if (eigenvectors[0][1] < 0) {
-        eigenvectors[0][1] = -eigenvectors[0][1];
-        eigenvectors[1][1] = -eigenvectors[1][1];
+    // Apply sign convention to match original implementation
+    // Ensure first component of each eigenvector is positive
+    for (int j = 0; j < DIM; j++) {
+        if (eigenvectors[0][j] < 0) {
+            for (int i = 0; i < DIM; i++) {
+                eigenvectors[i][j] = -eigenvectors[i][j];
+            }
+        }
     }
 }
 
@@ -155,11 +151,10 @@ int main() {
     double V[DIM][DIM] = {{-2.2855, -1.5555}, {-1.5555, -3.4639}};
     
     double Hcore[DIM][DIM];
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            Hcore[i][j] = T[i][j] + V[i][j];
-        }
-    }
+    
+    // Hcore = T + V using BLAS
+    cblas_dcopy(DIM * DIM, (double*)T, 1, (double*)Hcore, 1);
+    cblas_daxpy(DIM * DIM, 1.0, (double*)V, 1, (double*)Hcore, 1);
     
     printf("=== DEBUG INFORMATION ===\n");
     print_matrix("S matrix", S);
@@ -168,7 +163,7 @@ int main() {
     // Diagonalize S
     double SVAL[DIM];
     double SVEC[DIM][DIM];
-    diagonalize_2x2(S, SVAL, SVEC);
+    diagonalize_symmetric(S, SVAL, SVEC);
     
     printf("S eigenvalues: %.4f %.4f\n", SVAL[0], SVAL[1]);
     print_matrix("S eigenvectors", SVEC);
@@ -181,28 +176,22 @@ int main() {
     
     printf("SVAL^(-1/2) diagonal: %.8f, %.8f\n\n", SVAL_minhalf[0][0], SVAL_minhalf[1][1]);
     
-    // Calculate S_minhalf = SVEC * SVAL_minhalf * SVEC^T
+    // Calculate S_minhalf = SVEC * SVAL_minhalf * SVEC^T using BLAS
     double temp[DIM][DIM], S_minhalf[DIM][DIM];
     
     // temp = SVEC * SVAL_minhalf
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            temp[i][j] = 0.0;
-            for (int k = 0; k < DIM; k++) {
-                temp[i][j] += SVEC[i][k] * SVAL_minhalf[k][j];
-            }
-        }
-    }
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 
+                DIM, DIM, DIM, 1.0, 
+                (double*)SVEC, DIM, 
+                (double*)SVAL_minhalf, DIM, 
+                0.0, (double*)temp, DIM);
     
     // S_minhalf = temp * SVEC^T
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            S_minhalf[i][j] = 0.0;
-            for (int k = 0; k < DIM; k++) {
-                S_minhalf[i][j] += temp[i][k] * SVEC[j][k];
-            }
-        }
-    }
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 
+                DIM, DIM, DIM, 1.0, 
+                (double*)temp, DIM, 
+                (double*)SVEC, DIM, 
+                0.0, (double*)S_minhalf, DIM);
     
     print_matrix("S^(-1/2) matrix", S_minhalf);
     
@@ -226,28 +215,22 @@ int main() {
             print_matrix("F matrix (Fock)", F);
         }
         
-        // Calculate F' = S_minhalf^T * F * S_minhalf
+        // Calculate F' = S_minhalf^T * F * S_minhalf using BLAS
         double temp1[DIM][DIM], Fprime[DIM][DIM];
         
         // temp1 = S_minhalf^T * F
-        for (int i = 0; i < DIM; i++) {
-            for (int j = 0; j < DIM; j++) {
-                temp1[i][j] = 0.0;
-                for (int k = 0; k < DIM; k++) {
-                    temp1[i][j] += S_minhalf[k][i] * F[k][j];
-                }
-            }
-        }
+        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, 
+                    DIM, DIM, DIM, 1.0, 
+                    (double*)S_minhalf, DIM, 
+                    (double*)F, DIM, 
+                    0.0, (double*)temp1, DIM);
         
         // Fprime = temp1 * S_minhalf
-        for (int i = 0; i < DIM; i++) {
-            for (int j = 0; j < DIM; j++) {
-                Fprime[i][j] = 0.0;
-                for (int k = 0; k < DIM; k++) {
-                    Fprime[i][j] += temp1[i][k] * S_minhalf[k][j];
-                }
-            }
-        }
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 
+                    DIM, DIM, DIM, 1.0, 
+                    (double*)temp1, DIM, 
+                    (double*)S_minhalf, DIM, 
+                    0.0, (double*)Fprime, DIM);
         
         if (count == 1) {
             print_matrix("F' matrix (transformed Fock)", Fprime);
@@ -256,38 +239,35 @@ int main() {
         // Diagonalize F'
         double E[DIM];
         double Cprime[DIM][DIM];
-        diagonalize_2x2(Fprime, E, Cprime);
+        diagonalize_symmetric(Fprime, E, Cprime);
         
         if (count == 1) {
             printf("F' eigenvalues: %.8f %.8f\n", E[0], E[1]);
             print_matrix("F' eigenvectors (C')", Cprime);
         }
         
-        // Back transform: C = S_minhalf * Cprime
+        // Back transform: C = S_minhalf * Cprime using BLAS
         double C[DIM][DIM];
-        for (int i = 0; i < DIM; i++) {
-            for (int j = 0; j < DIM; j++) {
-                C[i][j] = 0.0;
-                for (int k = 0; k < DIM; k++) {
-                    C[i][j] += S_minhalf[i][k] * Cprime[k][j];
-                }
-            }
-        }
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 
+                    DIM, DIM, DIM, 1.0, 
+                    (double*)S_minhalf, DIM, 
+                    (double*)Cprime, DIM, 
+                    0.0, (double*)C, DIM);
         
         if (count == 1) {
             print_matrix("C matrix (back-transformed coefficients)", C);
         }
         
-        // Make density matrix
-        for (int mu = 0; mu < DIM; mu++) {
-            for (int nu = 0; nu < DIM; nu++) {
-                OLDP[mu][nu] = P[mu][nu];
-                P[mu][nu] = 0.0;
-                for (int m = 0; m < NELEC/2; m++) {
-                    P[mu][nu] = P[mu][nu] + 2.0 * C[mu][m] * C[nu][m];
-                }
-            }
-        }
+        // Save old density matrix
+        cblas_dcopy(DIM * DIM, (double*)P, 1, (double*)OLDP, 1);
+        
+        // Make new density matrix P = 2 * C_occ * C_occ^T using BLAS
+        // For closed shell with NELEC/2 occupied orbitals
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 
+                    DIM, DIM, NELEC/2, 2.0, 
+                    (double*)C, DIM, 
+                    (double*)C, DIM, 
+                    0.0, (double*)P, DIM);
         
         if (count == 1) {
             print_matrix("New P matrix", P);
