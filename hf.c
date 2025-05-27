@@ -60,9 +60,9 @@ double tei(int a, int b, int c, int d) {
     // Lookup table for precomputed two-electron integrals
     switch(abcd) {
         case 5:  return 0.7283;   // (11|11)
-        case 12: return 0.3418;   // (11|22) 
+        case 12: return 0.3418;   // (11|12) 
         case 14: return 0.2192;   // (12|12)
-        case 17: return 0.585;    // (11|12)
+        case 17: return 0.585;    // (11|22)
         case 19: return 0.4368;   // (12|22)
         case 20: return 0.9927;   // (22|22)
         default: return 0.0;
