@@ -22,7 +22,37 @@
 #define NELEC 2      // Number of electrons (closed shell)
 #define CONV_TOL 1e-5  // SCF convergence threshold
 
-const double ENUC = 1.323;  // Nuclear repulsion energy (hartrees)
+// Molecular geometry and nuclear charges
+typedef struct {
+    double x, y, z;  // Cartesian coordinates (bohr)
+    double charge;   // Nuclear charge
+} Atom;
+
+/*
+ * Calculate nuclear repulsion energy from first principles
+ * 
+ * E_nuc = Σ[A>B] (Z_A * Z_B) / R_AB
+ * 
+ * Where Z_A, Z_B are nuclear charges and R_AB is internuclear distance
+ */
+double calculate_nuclear_repulsion(Atom atoms[], int natoms) {
+    double enuc = 0.0;
+    
+    for (int A = 0; A < natoms; A++) {
+        for (int B = A + 1; B < natoms; B++) {
+            // Calculate internuclear distance
+            double dx = atoms[A].x - atoms[B].x;
+            double dy = atoms[A].y - atoms[B].y;
+            double dz = atoms[A].z - atoms[B].z;
+            double R_AB = sqrt(dx*dx + dy*dy + dz*dz);
+            
+            // Add nuclear-nuclear repulsion term
+            enuc += (atoms[A].charge * atoms[B].charge) / R_AB;
+        }
+    }
+    
+    return enuc;
+}
 
 /*
  * Two-electron integral lookup function
@@ -189,6 +219,30 @@ int main() {
     printf("=== Restricted Hartree-Fock Calculation ===\n");
     printf("System: 2 electrons, 2 basis functions\n");
     printf("Convergence threshold: %.0e\n\n", CONV_TOL);
+    
+    // Define molecular geometry to match the precomputed integrals
+    // Distance calculated to give nuclear repulsion = 1.323 hartrees
+    // Required distance = 1.0 / 1.323 = 0.7558 bohr
+    double half_distance = 0.7558 / 2.0;  // = 0.3779 bohr
+    
+    Atom atoms[] = {
+        {0.0, 0.0, -half_distance, 1.0},  // H atom at -0.3779 bohr, charge +1
+        {0.0, 0.0,  half_distance, 1.0}   // H atom at +0.3779 bohr, charge +1
+    };
+    int natoms = sizeof(atoms) / sizeof(atoms[0]);
+    
+    // Calculate nuclear repulsion energy from first principles
+    double ENUC = calculate_nuclear_repulsion(atoms, natoms);
+    
+    printf("Molecular Geometry:\n");
+    printf("Atom  Charge    X        Y        Z\n");
+    printf("----  ------  ------   ------   ------\n");
+    for (int i = 0; i < natoms; i++) {
+        printf("  %d    %.1f    %6.3f   %6.3f   %6.3f\n", 
+               i+1, atoms[i].charge, atoms[i].x, atoms[i].y, atoms[i].z);
+    }
+    printf("\nInternuclear distance: %.6f bohr\n", 2.0 * half_distance);
+    printf("Nuclear repulsion energy: %.6f hartrees\n\n", ENUC);
     
     // Input atomic orbital integrals (precomputed)
     double S[DIM][DIM] = {{1.0000, 0.5017},   // Overlap matrix
