@@ -1,360 +1,343 @@
-/*
- * Restricted Hartree-Fock (RHF) Implementation
- * 
- * This program performs a self-consistent field (SCF) calculation for a 
- * simple two-electron molecule using the Hartree-Fock method with a 
- * minimal basis set (2 basis functions).
- *
- * The calculation follows the canonical Roothaan-Hall SCF procedure:
- * 1. Build core Hamiltonian and overlap matrices
- * 2. Construct orthogonalization matrix S^(-1/2)
- * 3. Iteratively solve FC = SCE until convergence
- * 4. Calculate final electronic and total energies
- */
-
-#include <stdio.h>
 #include <math.h>
-#include <cblas.h>
-#include <lapacke.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-// System parameters
-#define DIM 2        // Number of basis functions
-#define NELEC 2      // Number of electrons (closed shell)
-#define CONV_TOL 1e-5  // SCF convergence threshold
+// Minimal structure for 3D vectors only
+typedef struct { double x, y, z; } vec3_t;
 
-// Molecular geometry and nuclear charges
-typedef struct {
-    double x, y, z;  // Cartesian coordinates (bohr)
-    double charge;   // Nuclear charge
-} Atom;
+// Mathematical constants
+#define PI 3.14159265358979323846
+#define SQRT_PI 1.77245385090551602729
 
-/*
- * Calculate nuclear repulsion energy from first principles
- * 
- * E_nuc = Σ[A>B] (Z_A * Z_B) / R_AB
- * 
- * Where Z_A, Z_B are nuclear charges and R_AB is internuclear distance
- */
-double calculate_nuclear_repulsion(Atom atoms[], int natoms) {
-    double enuc = 0.0;
-    
-    for (int A = 0; A < natoms; A++) {
-        for (int B = A + 1; B < natoms; B++) {
-            // Calculate internuclear distance
-            double dx = atoms[A].x - atoms[B].x;
-            double dy = atoms[A].y - atoms[B].y;
-            double dz = atoms[A].z - atoms[B].z;
-            double R_AB = sqrt(dx*dx + dy*dy + dz*dz);
-            
-            // Add nuclear-nuclear repulsion term
-            enuc += (atoms[A].charge * atoms[B].charge) / R_AB;
-        }
-    }
-    
-    return enuc;
+// Pure functional vector operations
+static inline vec3_t vec3_add(vec3_t a, vec3_t b) {
+    return (vec3_t){a.x + b.x, a.y + b.y, a.z + b.z};
 }
 
-/*
- * Two-electron integral lookup function
- * 
- * Uses the 8-fold symmetry of electron repulsion integrals (ERIs):
- * (ab|cd) = (ba|cd) = (ab|dc) = (ba|dc) = (cd|ab) = (dc|ab) = (cd|ba) = (dc|ba)
- * 
- * The eint() function maps 4 indices to a unique compound index using
- * Yoshimine's triangular packing scheme for efficient storage.
- */
-double tei(int a, int b, int c, int d) {
-    long ab, cd, abcd;
-    
-    // Pack ab indices: larger index first, then triangular packing
-    if (a > b) {
-        ab = (long)a * (a + 1) / 2 + b;
-    } else {
-        ab = (long)b * (b + 1) / 2 + a;
-    }
-    
-    // Pack cd indices: larger index first, then triangular packing  
-    if (c > d) {
-        cd = (long)c * (c + 1) / 2 + d;
-    } else {
-        cd = (long)d * (d + 1) / 2 + c;
-    }
-    
-    // Pack ab,cd pair: larger pair first, then triangular packing
-    if (ab > cd) {
-        abcd = ab * (ab + 1) / 2 + cd;
-    } else {
-        abcd = cd * (cd + 1) / 2 + ab;
-    }
-    
-    // Lookup table for precomputed two-electron integrals
-    switch(abcd) {
-        case 5:  return 0.7283;   // (11|11)
-        case 12: return 0.3418;   // (11|12) 
-        case 14: return 0.2192;   // (12|12)
-        case 17: return 0.585;    // (11|22)
-        case 19: return 0.4368;   // (12|22)
-        case 20: return 0.9927;   // (22|22)
-        default: return 0.0;
-    }
+static inline vec3_t vec3_sub(vec3_t a, vec3_t b) {
+    return (vec3_t){a.x - b.x, a.y - b.y, a.z - b.z};
 }
 
-/*
- * Build Fock matrix using core Hamiltonian and density matrix
- * 
- * F[μν] = H[μν] + Σ[λσ] P[λσ] * [(μν|λσ) - 0.5*(μλ|νσ)]
- *                              Coulomb    Exchange
- * 
- * The Fock matrix represents the effective one-electron Hamiltonian
- * that includes electron-electron interactions in a mean-field manner.
- */
-void build_fock(double H[DIM][DIM], double P[DIM][DIM], double F[DIM][DIM]) {
-    for (int mu = 0; mu < DIM; mu++) {
-        for (int nu = 0; nu < DIM; nu++) {
-            // Start with core Hamiltonian (kinetic + nuclear attraction)
-            F[mu][nu] = H[mu][nu];
-            
-            // Add electron-electron contributions
-            for (int lambda = 0; lambda < DIM; lambda++) {
-                for (int sigma = 0; sigma < DIM; sigma++) {
-                    // Coulomb term: attraction to electron density
-                    // Exchange term: quantum mechanical correction (factor of 0.5 for RHF)
-                    F[mu][nu] += P[lambda][sigma] * 
-                        (tei(mu+1, nu+1, lambda+1, sigma+1) - 
-                         0.5 * tei(mu+1, lambda+1, nu+1, sigma+1));
-                }
-            }
-        }
-    }
+static inline vec3_t vec3_scale(vec3_t v, double s) {
+    return (vec3_t){v.x * s, v.y * s, v.z * s};
 }
 
-/*
- * Calculate electronic energy using density and Fock matrices
- * 
- * E_elec = 0.5 * Σ[μν] P[μν] * (H[μν] + F[μν])
- * 
- * This is the expectation value of the electronic Hamiltonian.
- * The factor of 0.5 prevents double counting of electron-electron interactions.
- */
-double electronic_energy(double P[DIM][DIM], double H[DIM][DIM], double F[DIM][DIM]) {
-    double energy = 0.0;
-    for (int mu = 0; mu < DIM; mu++) {
-        for (int nu = 0; nu < DIM; nu++) {
-            energy += 0.5 * P[mu][nu] * (H[mu][nu] + F[mu][nu]);
-        }
-    }
-    return energy;
+static inline double vec3_dot(vec3_t a, vec3_t b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-/*
- * Calculate change in density matrix between SCF iterations
- * 
- * Returns the Frobenius norm: ||P_new - P_old||_F = sqrt(Σ[ij] (ΔP[ij])²)
- * Used as convergence criterion for the SCF procedure.
- */
-double density_change(double P[DIM][DIM], double P_old[DIM][DIM]) {
-    double change = 0.0;
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            double diff = P[i][j] - P_old[i][j];
-            change += diff * diff;
-        }
-    }
-    return sqrt(change);
+static inline double vec3_norm2(vec3_t v) {
+    return vec3_dot(v, v);
 }
 
-/*
- * Diagonalize symmetric matrix using LAPACK
- * 
- * Solves the eigenvalue problem: A * v = λ * v
- * Returns eigenvalues in ascending order and corresponding eigenvectors.
- * Applies sign convention: first component of each eigenvector is positive.
- */
-void diagonalize(double mat[DIM][DIM], double eigenvals[DIM], double eigenvecs[DIM][DIM]) {
-    double work[DIM * DIM];
+// Pure functional factorial implementation
+static double factorial_impl(int n, double acc) {
+    return (n <= 1) ? acc : factorial_impl(n - 1, acc * n);
+}
+
+static double factorial(int n) {
+    return (n < 0) ? 0.0 : factorial_impl(n, 1.0);
+}
+
+// Double factorial: n!! = n * (n-2) * (n-4) * ...
+static double double_factorial_impl(int n, double acc) {
+    return (n <= 1) ? acc : double_factorial_impl(n - 2, acc * n);
+}
+
+static double double_factorial(int n) {
+    return (n < 0) ? 1.0 : double_factorial_impl(n, 1.0);
+}
+
+// Boys function F_n(x) using series expansion for small x, asymptotic for large x
+static double boys_series(int n, double x, int term, double acc) {
+    if (term > 50) return acc;  // Convergence check
+    double term_val = pow(-x, term) / (factorial(term) * (2.0 * n + 2.0 * term + 1.0));
+    if (fabs(term_val) < 1e-15) return acc;
+    return boys_series(n, x, term + 1, acc + term_val);
+}
+
+static double boys_asymptotic(int n, double x) {
+    return double_factorial(2 * n - 1) * sqrt(PI) / (2.0 * pow(2.0 * x, n + 0.5));
+}
+
+static double boys_function(int n, double x) {
+    if (x < 1e-10) return 1.0 / (2.0 * n + 1.0);  // Limit as x -> 0
+    if (x > 20.0) return boys_asymptotic(n, x);
+    return boys_series(n, x, 0, 0.0);
+}
+
+// Gaussian normalization constant
+static double gaussian_norm(int l, int m, int n, double alpha) {
+    double norm = pow(2.0 * alpha / PI, 0.75) * 
+                  pow(8.0 * alpha, (l + m + n) / 2.0) / 
+                  sqrt(double_factorial(2 * l - 1) * 
+                       double_factorial(2 * m - 1) * 
+                       double_factorial(2 * n - 1));
+    return norm;
+}
+
+// Gaussian product rule: product of two Gaussians is a Gaussian
+static double gaussian_product_coeff(vec3_t a_center, double a_alpha,
+                                   vec3_t b_center, double b_alpha) {
+    vec3_t diff = vec3_sub(a_center, b_center);
+    double gamma = a_alpha + b_alpha;
+    double prefactor = exp(-a_alpha * b_alpha * vec3_norm2(diff) / gamma);
+    return prefactor * pow(PI / gamma, 1.5);
+}
+
+static vec3_t gaussian_product_center(vec3_t a_center, double a_alpha,
+                                    vec3_t b_center, double b_alpha) {
+    double gamma = a_alpha + b_alpha;
+    return vec3_scale(vec3_add(vec3_scale(a_center, a_alpha),
+                              vec3_scale(b_center, b_alpha)), 1.0 / gamma);
+}
+
+// 1D overlap integral - analytical formula for Gaussian primitives
+static double overlap_1d(int i, int j, double xa, double xb, double alpha, double beta) {
+    if (i < 0 || j < 0) return 0.0;
     
-    // Convert from row-major (C) to column-major (FORTRAN/LAPACK) storage
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            work[j * DIM + i] = mat[i][j];
-        }
+    double gamma = alpha + beta;
+    double xp = (alpha * xa + beta * xb) / gamma;
+    double prefactor = exp(-alpha * beta * (xa - xb) * (xa - xb) / gamma) * sqrt(PI / gamma);
+    
+    // For s-orbitals (i=j=0)
+    if (i == 0 && j == 0) {
+        return prefactor;
     }
     
-    // Call LAPACK symmetric eigenvalue solver
-    // 'V': compute eigenvalues and eigenvectors
-    // 'U': use upper triangle of matrix
-    LAPACKE_dsyev(LAPACK_COL_MAJOR, 'V', 'U', DIM, work, DIM, eigenvals);
-    
-    // Convert eigenvectors back to row-major and apply sign convention
-    for (int j = 0; j < DIM; j++) {
-        // Ensure first component is positive for consistent results
-        if (work[j * DIM] < 0) {
-            for (int i = 0; i < DIM; i++) {
-                eigenvecs[i][j] = -work[j * DIM + i];
-            }
-        } else {
-            for (int i = 0; i < DIM; i++) {
-                eigenvecs[i][j] = work[j * DIM + i];
-            }
-        }
+    // Recursive Obara-Saika for higher angular momentum
+    if (i > 0) {
+        double term1 = (xp - xa) * overlap_1d(i - 1, j, xa, xb, alpha, beta);
+        double term2 = (i - 1 > 0) ? (i - 1) / (2.0 * gamma) * overlap_1d(i - 2, j, xa, xb, alpha, beta) : 0.0;
+        double term3 = (j > 0) ? j / (2.0 * gamma) * overlap_1d(i - 1, j - 1, xa, xb, alpha, beta) : 0.0;
+        return term1 + term2 + term3;
+    } else if (j > 0) {
+        double term1 = (xp - xb) * overlap_1d(i, j - 1, xa, xb, alpha, beta);
+        double term2 = (j - 1 > 0) ? (j - 1) / (2.0 * gamma) * overlap_1d(i, j - 2, xa, xb, alpha, beta) : 0.0;
+        double term3 = (i > 0) ? i / (2.0 * gamma) * overlap_1d(i - 1, j - 1, xa, xb, alpha, beta) : 0.0;
+        return term1 + term2 + term3;
     }
+    
+    return 0.0;
 }
 
-/*
- * Main SCF Program
- * 
- * Implements the Roothaan-Hall SCF procedure for restricted Hartree-Fock:
- * 1. Initialize atomic orbital basis integrals
- * 2. Build orthogonalization transformation X = S^(-1/2)
- * 3. SCF iterations until convergence:
- *    a) Build Fock matrix F from current density P
- *    b) Transform to orthogonal basis: F' = X†FX  
- *    c) Diagonalize F' to get molecular orbital coefficients C'
- *    d) Back-transform to AO basis: C = XC'
- *    e) Build new density matrix from occupied orbitals
- *    f) Check for convergence
- * 4. Calculate final energy and print results
- */
+// 1D kinetic energy integral
+static double kinetic_1d(int i, int j, double xa, double xb, double alpha, double beta) {
+    // T_ij = β * [(2j+1)S_ij - 2β*S_i,j+2 - (1/2)*j*(j-1)*S_i,j-2]
+    double s_ij = overlap_1d(i, j, xa, xb, alpha, beta);
+    double s_ij_plus2 = overlap_1d(i, j + 2, xa, xb, alpha, beta);
+    double s_ij_minus2 = (j >= 2) ? overlap_1d(i, j - 2, xa, xb, alpha, beta) : 0.0;
+    
+    double term1 = beta * (2 * j + 1) * s_ij;
+    double term2 = -2.0 * beta * beta * s_ij_plus2;
+    double term3 = (j >= 2) ? -0.5 * beta * j * (j - 1) * s_ij_minus2 : 0.0;
+    
+    return term1 + term2 + term3;
+}
+
+// Main overlap integral
+double overlap(vec3_t a_center, double a_alpha, int a_l, int a_m, int a_n,
+               vec3_t b_center, double b_alpha, int b_l, int b_m, int b_n) {
+    
+    double norm_a = gaussian_norm(a_l, a_m, a_n, a_alpha);
+    double norm_b = gaussian_norm(b_l, b_m, b_n, b_alpha);
+    
+    double sx = overlap_1d(a_l, b_l, a_center.x, b_center.x, a_alpha, b_alpha);
+    double sy = overlap_1d(a_m, b_m, a_center.y, b_center.y, a_alpha, b_alpha);
+    double sz = overlap_1d(a_n, b_n, a_center.z, b_center.z, a_alpha, b_alpha);
+    
+    return norm_a * norm_b * sx * sy * sz;
+}
+
+// Kinetic energy integral
+double kinetic(vec3_t a_center, double a_alpha, int a_l, int a_m, int a_n,
+               vec3_t b_center, double b_alpha, int b_l, int b_m, int b_n) {
+    
+    double norm_a = gaussian_norm(a_l, a_m, a_n, a_alpha);
+    double norm_b = gaussian_norm(b_l, b_m, b_n, b_alpha);
+    
+    // T = Tx * Sy * Sz + Sx * Ty * Sz + Sx * Sy * Tz
+    double tx = kinetic_1d(a_l, b_l, a_center.x, b_center.x, a_alpha, b_alpha);
+    double ty = kinetic_1d(a_m, b_m, a_center.y, b_center.y, a_alpha, b_alpha);
+    double tz = kinetic_1d(a_n, b_n, a_center.z, b_center.z, a_alpha, b_alpha);
+    
+    double sx = overlap_1d(a_l, b_l, a_center.x, b_center.x, a_alpha, b_alpha);
+    double sy = overlap_1d(a_m, b_m, a_center.y, b_center.y, a_alpha, b_alpha);
+    double sz = overlap_1d(a_n, b_n, a_center.z, b_center.z, a_alpha, b_alpha);
+    
+    return norm_a * norm_b * (tx * sy * sz + sx * ty * sz + sx * sy * tz);
+}
+
+// Nuclear attraction integral
+double nuclear(vec3_t a_center, double a_alpha, int a_l, int a_m, int a_n,
+               vec3_t b_center, double b_alpha, int b_l, int b_m, int b_n,
+               vec3_t nuclear_center, double nuclear_charge) {
+    
+    double gamma = a_alpha + b_alpha;
+    vec3_t p_center = gaussian_product_center(a_center, a_alpha, b_center, b_alpha);
+    vec3_t pc = vec3_sub(p_center, nuclear_center);
+    double t = gamma * vec3_norm2(pc);
+    
+    double norm_a = gaussian_norm(a_l, a_m, a_n, a_alpha);
+    double norm_b = gaussian_norm(b_l, b_m, b_n, b_alpha);
+    double product_coeff = gaussian_product_coeff(a_center, a_alpha, b_center, b_alpha);
+    
+    // For s-orbitals only
+    if (a_l == 0 && a_m == 0 && a_n == 0 && b_l == 0 && b_m == 0 && b_n == 0) {
+        return -nuclear_charge * norm_a * norm_b * product_coeff * 
+               2.0 * PI / gamma * boys_function(0, t);
+    }
+    
+    return 0.0;  // Higher angular momentum not implemented
+}
+
+// Electron repulsion integral (s-orbitals only)
+double eri(vec3_t a_center, double a_alpha, int a_l, int a_m, int a_n,
+           vec3_t b_center, double b_alpha, int b_l, int b_m, int b_n,
+           vec3_t c_center, double c_alpha, int c_l, int c_m, int c_n,
+           vec3_t d_center, double d_alpha, int d_l, int d_m, int d_n) {
+    
+    // Only implement for s-orbitals
+    if (a_l || a_m || a_n || b_l || b_m || b_n || c_l || c_m || c_n || d_l || d_m || d_n) {
+        return 0.0;
+    }
+    
+    double gamma_p = a_alpha + b_alpha;
+    double gamma_q = c_alpha + d_alpha;
+    double delta = 0.25 * (1.0/gamma_p + 1.0/gamma_q);
+    
+    vec3_t p_center = gaussian_product_center(a_center, a_alpha, b_center, b_alpha);
+    vec3_t q_center = gaussian_product_center(c_center, c_alpha, d_center, d_alpha);
+    vec3_t pq = vec3_sub(p_center, q_center);
+    double t = vec3_norm2(pq) / (4.0 * delta);
+    
+    double norm_a = gaussian_norm(0, 0, 0, a_alpha);
+    double norm_b = gaussian_norm(0, 0, 0, b_alpha);
+    double norm_c = gaussian_norm(0, 0, 0, c_alpha);
+    double norm_d = gaussian_norm(0, 0, 0, d_alpha);
+    
+    double product_coeff_ab = gaussian_product_coeff(a_center, a_alpha, b_center, b_alpha);
+    double product_coeff_cd = gaussian_product_coeff(c_center, c_alpha, d_center, d_alpha);
+    
+    return norm_a * norm_b * norm_c * norm_d * product_coeff_ab * product_coeff_cd * 
+           2.0 * pow(PI, 2.5) / (gamma_p * gamma_q * sqrt(gamma_p + gamma_q)) * 
+           boys_function(0, t);
+}
+
+// Test functions for validation
+static void test_boys_function(void) {
+    printf("Boys Function Tests:\n");
+    printf("F₀(0.0) = %.8f (expected: 1.0)\n", boys_function(0, 0.0));
+    printf("F₀(1.0) = %.8f (expected: ~0.746)\n", boys_function(0, 1.0));
+    printf("F₁(0.0) = %.8f (expected: 0.333)\n", boys_function(1, 0.0));
+    printf("\n");
+}
+
+static void test_gaussian_properties(void) {
+    vec3_t origin = {0.0, 0.0, 0.0};
+    double alpha = 1.0;
+    
+    printf("Gaussian Property Tests:\n");
+    double s_self = overlap(origin, alpha, 0, 0, 0, origin, alpha, 0, 0, 0);
+    printf("Self-overlap (normalized): %.8f (should be 1.0)\n", s_self);
+    
+    vec3_t displaced = {1.0, 0.0, 0.0};
+    double s_displaced = overlap(origin, alpha, 0, 0, 0, displaced, alpha, 0, 0, 0);
+    printf("Overlap at 1 Bohr separation: %.8f\n", s_displaced);
+    printf("\n");
+}
+
+// Demonstration: H2 molecule calculation with enhanced validation
 int main() {
-    printf("=== Restricted Hartree-Fock Calculation ===\n");
-    printf("System: 2 electrons, 2 basis functions\n");
-    printf("Convergence threshold: %.0e\n\n", CONV_TOL);
+    printf("Molecular Integral Library - Functional Programming Style\n");
+    printf("=========================================================\n\n");
     
-    // Define molecular geometry to match the precomputed integrals
-    // Distance calculated to give nuclear repulsion = 1.323 hartrees
-    // Required distance = 1.0 / 1.323 = 0.7558 bohr
-    double half_distance = 0.7558 / 2.0;  // = 0.3779 bohr
+    // Run validation tests
+    test_boys_function();
+    test_gaussian_properties();
     
-    Atom atoms[] = {
-        {0.0, 0.0, -half_distance, 1.0},  // H atom at -0.3779 bohr, charge +1
-        {0.0, 0.0,  half_distance, 1.0}   // H atom at +0.3779 bohr, charge +1
-    };
-    int natoms = sizeof(atoms) / sizeof(atoms[0]);
+    // H2 molecule: two hydrogen atoms
+    vec3_t h1_center = {0.0, 0.0, -0.7};  // Bohrs
+    vec3_t h2_center = {0.0, 0.0, +0.7};
+    double h_alpha = 1.24;  // Exponent for H 1s orbital
     
-    // Calculate nuclear repulsion energy from first principles
-    double ENUC = calculate_nuclear_repulsion(atoms, natoms);
+    // All orbitals are 1s (l=m=n=0)
+    int l = 0, m = 0, n = 0;
     
-    printf("Molecular Geometry:\n");
-    printf("Atom  Charge    X        Y        Z\n");
-    printf("----  ------  ------   ------   ------\n");
-    for (int i = 0; i < natoms; i++) {
-        printf("  %d    %.1f    %6.3f   %6.3f   %6.3f\n", 
-               i+1, atoms[i].charge, atoms[i].x, atoms[i].y, atoms[i].z);
-    }
-    printf("\nInternuclear distance: %.6f bohr\n", 2.0 * half_distance);
-    printf("Nuclear repulsion energy: %.6f hartrees\n\n", ENUC);
+    printf("H2 Molecule Integrals (Bond length = 1.4 Bohr)\n");
+    printf("Nuclear positions: H1(0,0,-0.7), H2(0,0,+0.7)\n");
+    printf("Orbital exponent: α = %.2f\n\n", h_alpha);
     
-    // Input atomic orbital integrals (precomputed)
-    double S[DIM][DIM] = {{1.0000, 0.5017},   // Overlap matrix
-                          {0.5017, 1.0000}};
+    // Overlap integrals
+    double s11 = overlap(h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n);
+    double s12 = overlap(h1_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n);
+    double s22 = overlap(h2_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n);
     
-    double T[DIM][DIM] = {{0.6249, 0.2395},   // Kinetic energy matrix
-                          {0.2395, 1.1609}};
+    printf("Overlap Integrals:\n");
+    printf("S₁₁ = %12.8f  (should be ≈ 1.0)\n", s11);
+    printf("S₁₂ = %12.8f  (intermolecular overlap)\n", s12);
+    printf("S₂₂ = %12.8f  (should be ≈ 1.0)\n", s22);
+    printf("Normalization check: |S₁₁ - 1.0| = %.2e\n", fabs(s11 - 1.0));
+    printf("Symmetry check: |S₁₁ - S₂₂| = %.2e\n\n", fabs(s11 - s22));
     
-    double V[DIM][DIM] = {{-2.2855, -1.5555}, // Nuclear attraction matrix
-                          {-1.5555, -3.4639}};
+    // Kinetic energy integrals
+    double t11 = kinetic(h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n);
+    double t12 = kinetic(h1_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n);
+    double t22 = kinetic(h2_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n);
     
-    // Build core Hamiltonian: H = T + V
-    double H[DIM][DIM];
-    for (int i = 0; i < DIM; i++) {
-        for (int j = 0; j < DIM; j++) {
-            H[i][j] = T[i][j] + V[i][j];
-        }
-    }
+    printf("Kinetic Energy Integrals:\n");
+    printf("T₁₁ = %12.8f  (α²/2 = %.8f)\n", t11, h_alpha * h_alpha / 2.0);
+    printf("T₁₂ = %12.8f\n", t12);
+    printf("T₂₂ = %12.8f\n", t22);
+    printf("Symmetry check: |T₁₁ - T₂₂| = %.2e\n\n", fabs(t11 - t22));
     
-    // === Step 1: Build orthogonalization matrix S^(-1/2) ===
+    // Nuclear attraction integrals
+    double v11_1 = nuclear(h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n, h1_center, 1.0);
+    double v11_2 = nuclear(h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n, h2_center, 1.0);
+    double v12_1 = nuclear(h1_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n, h1_center, 1.0);
+    double v12_2 = nuclear(h1_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n, h2_center, 1.0);
+    double v22_1 = nuclear(h2_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n, h1_center, 1.0);
+    double v22_2 = nuclear(h2_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n, h2_center, 1.0);
     
-    // Diagonalize overlap matrix: S = U * s * U†
-    double s_vals[DIM], s_vecs[DIM][DIM];
-    diagonalize(S, s_vals, s_vecs);
+    printf("Nuclear Attraction Integrals:\n");
+    printf("V₁₁⁽¹⁾ = %12.8f  (orbital 1 with nucleus 1)\n", v11_1);
+    printf("V₁₁⁽²⁾ = %12.8f  (orbital 1 with nucleus 2)\n", v11_2);
+    printf("V₁₂⁽¹⁾ = %12.8f  (cross term with nucleus 1)\n", v12_1);
+    printf("V₁₂⁽²⁾ = %12.8f  (cross term with nucleus 2)\n", v12_2);
+    printf("Symmetry checks:\n");
+    printf("  |V₁₁⁽²⁾ - V₂₂⁽¹⁾| = %.2e\n", fabs(v11_2 - v22_1));
+    printf("  |V₁₂⁽¹⁾ - V₁₂⁽²⁾| = %.2e\n\n", fabs(v12_1 - v12_2));
     
-    // Build diagonal matrix of s^(-1/2)
-    double s_diag[DIM][DIM] = {0};
-    for (int i = 0; i < DIM; i++) {
-        s_diag[i][i] = pow(s_vals[i], -0.5);
-    }
+    // Electron repulsion integrals
+    double eri_1111 = eri(h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n,
+                         h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n);
+    double eri_1112 = eri(h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n,
+                         h1_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n);
+    double eri_1122 = eri(h1_center, h_alpha, l, m, n, h1_center, h_alpha, l, m, n,
+                         h2_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n);
+    double eri_1212 = eri(h1_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n,
+                         h1_center, h_alpha, l, m, n, h2_center, h_alpha, l, m, n);
     
-    // Construct S^(-1/2) = U * s^(-1/2) * U†
-    double temp[DIM][DIM], X[DIM][DIM];
-    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 
-                DIM, DIM, DIM, 1.0, (double*)s_vecs, DIM, 
-                (double*)s_diag, DIM, 0.0, (double*)temp, DIM);
-    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans, 
-                DIM, DIM, DIM, 1.0, (double*)temp, DIM, 
-                (double*)s_vecs, DIM, 0.0, (double*)X, DIM);
+    printf("Electron Repulsion Integrals:\n");
+    printf("(11|11) = %12.8f  (Coulomb self-repulsion)\n", eri_1111);
+    printf("(11|12) = %12.8f  (Cross Coulomb)\n", eri_1112);
+    printf("(11|22) = %12.8f  (Inter-center Coulomb)\n", eri_1122);
+    printf("(12|12) = %12.8f  (Exchange integral)\n\n", eri_1212);
     
-    // === Step 2: SCF Iterations ===
+    // Core Hamiltonian matrix elements
+    double h11 = t11 + v11_1 + v11_2;
+    double h12 = t12 + v12_1 + v12_2;
+    double h22 = t22 + v22_1 + v22_2;
     
-    double P[DIM][DIM] = {0};    // Density matrix (start with zero guess)
-    double P_old[DIM][DIM];      // Previous iteration density
-    double delta = 1.0;          // Convergence measure
-    int iter = 0;                // Iteration counter
+    printf("Core Hamiltonian Matrix:\n");
+    printf("H₁₁ = %12.8f\n", h11);
+    printf("H₁₂ = %12.8f\n", h12);
+    printf("H₂₂ = %12.8f\n", h22);
+    printf("Symmetry check: |H₁₁ - H₂₂| = %.2e\n\n", fabs(h11 - h22));
     
-    printf("SCF Iterations:\n");
-    printf("Iter     Energy (au)     Delta P\n");
-    printf("----  --------------  -----------\n");
-    
-    while (delta > CONV_TOL && iter < 50) {
-        iter++;
-        
-        // Save current density for convergence check
-        for (int i = 0; i < DIM; i++) {
-            for (int j = 0; j < DIM; j++) {
-                P_old[i][j] = P[i][j];
-            }
-        }
-        
-        // Build Fock matrix from current density
-        double F[DIM][DIM];
-        build_fock(H, P, F);
-        
-        // Transform Fock matrix to orthogonal basis: F' = X† * F * X
-        double F_prime[DIM][DIM], temp1[DIM][DIM];
-        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans, 
-                    DIM, DIM, DIM, 1.0, (double*)X, DIM, 
-                    (double*)F, DIM, 0.0, (double*)temp1, DIM);
-        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 
-                    DIM, DIM, DIM, 1.0, (double*)temp1, DIM, 
-                    (double*)X, DIM, 0.0, (double*)F_prime, DIM);
-        
-        // Diagonalize transformed Fock matrix: F' * C' = E * C'
-        double E[DIM], C_prime[DIM][DIM];
-        diagonalize(F_prime, E, C_prime);
-        
-        // Back-transform molecular orbital coefficients: C = X * C'
-        double C[DIM][DIM];
-        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 
-                    DIM, DIM, DIM, 1.0, (double*)X, DIM, 
-                    (double*)C_prime, DIM, 0.0, (double*)C, DIM);
-        
-        // Build new density matrix from occupied orbitals
-        // P[μν] = 2 * Σ[i occupied] C[μi] * C[νi]
-        // Factor of 2 accounts for spin (closed shell: 2 electrons per spatial orbital)
-        for (int mu = 0; mu < DIM; mu++) {
-            for (int nu = 0; nu < DIM; nu++) {
-                P[mu][nu] = 2.0 * C[mu][0] * C[nu][0];  // Only lowest orbital occupied
-            }
-        }
-        
-        // Check convergence and calculate energy
-        delta = density_change(P, P_old);
-        double energy = electronic_energy(P, H, F) + ENUC;
-        
-        printf("%3d   %14.6f   %.2e\n", iter, energy, delta);
-    }
-    
-    // === Step 3: Final Results ===
-    
-    // Recalculate final energy with converged density
-    double F_final[DIM][DIM];
-    build_fock(H, P, F_final);
-    double final_energy = electronic_energy(P, H, F_final) + ENUC;
-    
-    printf("\n=== SCF Converged ===\n");
-    printf("Iterations: %d\n", iter);
-    printf("Final Energy: %.15f hartrees\n", final_energy);
-    printf("Nuclear Repulsion: %.6f hartrees\n", ENUC);
-    printf("Electronic Energy: %.15f hartrees\n", final_energy - ENUC);
-    
+    // Simple energy estimates
+    printf("Simple Energy Estimates:\n");
+    printf("Binding energy (crude): %.6f Hartree\n", h12 / s12);
+    printf("Orbital energy estimate: %.6f Hartree\n\n", h11);
     return 0;
 }
